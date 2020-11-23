@@ -2,6 +2,7 @@
 
 import argparse
 import csv
+from decimal import Decimal
 import gzip
 import io
 import json
@@ -18,6 +19,13 @@ from target_s3_csv import s3
 from target_s3_csv import utils
 
 logger = singer.get_logger('target_s3_csv')
+
+
+class DecimalEncoder(json.JSONEncoder):
+    def default(self, o):
+        if isinstance(o, Decimal):
+            return float(o)
+        return super(DecimalEncoder, self).default(o)
 
 
 def emit_state(state):
@@ -78,7 +86,7 @@ def persist_messages(messages, config, s3_client):
             else:
                 record_to_load = utils.remove_metadata_values_from_record(o)
 
-            filename = o['stream'] + '-' + now + '.csv'
+            filename = o['stream'] + '-' + now + '.json'
             filename = os.path.expanduser(os.path.join(temp_dir, filename))
             target_key = utils.get_target_key(o,
                                               prefix=config.get('s3_key_prefix', ''),
@@ -89,28 +97,8 @@ def persist_messages(messages, config, s3_client):
 
             file_is_empty = (not os.path.isfile(filename)) or os.stat(filename).st_size == 0
 
-            flattened_record = utils.flatten_record(record_to_load)
-
-            if o['stream'] not in headers and not file_is_empty:
-                with open(filename, 'r') as csvfile:
-                    reader = csv.reader(csvfile,
-                                        delimiter=delimiter,
-                                        quotechar=quotechar)
-                    first_line = next(reader)
-                    headers[o['stream']] = first_line if first_line else flattened_record.keys()
-            else:
-                headers[o['stream']] = flattened_record.keys()
-
-            with open(filename, 'a') as csvfile:
-                writer = csv.DictWriter(csvfile,
-                                        headers[o['stream']],
-                                        extrasaction='ignore',
-                                        delimiter=delimiter,
-                                        quotechar=quotechar)
-                if file_is_empty:
-                    writer.writeheader()
-
-                writer.writerow(flattened_record)
+            with open(filename, 'a') as outfile:
+                outfile.write(json.dumps(record_to_load, cls=DecimalEncoder) + "\n")
 
             state = None
         elif message_type == 'STATE':
@@ -131,7 +119,7 @@ def persist_messages(messages, config, s3_client):
             logger.warning("Unknown message type {} in message {}"
                             .format(o['type'], o))
 
-    # Upload created CSV files to S3
+    # Upload created files to S3
     for filename, target_key in filenames:
         compressed_file = None
         if config.get("compression") is None or config["compression"].lower() == "none":
@@ -149,16 +137,18 @@ def persist_messages(messages, config, s3_client):
                     "Expected: 'none' or 'gzip'"
                     .format(config["compression"])
                 )
-        s3.upload_file(compressed_file or filename,
-                       s3_client,
-                       config.get('s3_bucket'),
-                       target_key,
-                       encryption_type=config.get('encryption_type'),
-                       encryption_key=config.get('encryption_key'))
+        if config.get("persist_remotely", True):
+            s3.upload_file(compressed_file or filename,
+                           s3_client,
+                           config.get('s3_bucket'),
+                           target_key,
+                           encryption_type=config.get('encryption_type'),
+                           encryption_key=config.get('encryption_key'))
 
         # Remove the local file(s)
-        os.remove(filename)
-        if compressed_file:
+        if config.get("remove_local", True):
+            os.remove(filename)
+        if compressed_file and config.get("remove_local", True):
             os.remove(compressed_file)
 
     return state
